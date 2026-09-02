@@ -47,9 +47,32 @@ async function mailjetFetch(path, options = {}) {
     json = text;
   }
   if (!res.ok) {
-    throw new Error(`Mailjet API error ${res.status}: ${JSON.stringify(json)}`);
+    const err = new Error(`Mailjet API error ${res.status}: ${JSON.stringify(json)}`);
+    err.status = res.status;
+    throw err;
   }
   return json;
+}
+
+// Marks an email address as unsubscribed in Mailjet: IsExcludedFromCampaigns
+// on the contact record. Works whether or not the contact already exists.
+async function unsubscribeEmail(email) {
+  try {
+    await mailjetFetch(`/v3/REST/contact/${encodeURIComponent(email)}`, {
+      method: "PUT",
+      body: JSON.stringify({ IsExcludedFromCampaigns: true }),
+    });
+  } catch (err) {
+    if (err.status === 404) {
+      // Contact doesn't exist in Mailjet yet — create it pre-excluded.
+      await mailjetFetch("/v3/REST/contact", {
+        method: "POST",
+        body: JSON.stringify({ Email: email, IsExcludedFromCampaigns: true }),
+      });
+    } else {
+      throw err;
+    }
+  }
 }
 
 function buildServer() {
@@ -100,7 +123,7 @@ function buildServer() {
 
   server.tool(
     "get_contact",
-    "Get a single Mailjet contact by email address",
+    "Get a single Mailjet contact by email address. The response includes IsExcludedFromCampaigns / UnsubscribedAt — check these before re-emailing anyone.",
     { email: z.string() },
     async (args) => {
       const result = await mailjetFetch(`/v3/REST/contact/${encodeURIComponent(args.email)}`);
@@ -133,6 +156,34 @@ function buildServer() {
         });
       }
       return { content: [{ type: "text", text: `Contact ${args.email} created/updated.` }] };
+    }
+  );
+
+  server.tool(
+    "unsubscribe_contact",
+    "Mark an email address as unsubscribed / excluded from future campaigns in Mailjet",
+    { email: z.string() },
+    async (args) => {
+      await unsubscribeEmail(args.email);
+      return { content: [{ type: "text", text: `${args.email} marked as unsubscribed in Mailjet.` }] };
+    }
+  );
+
+  server.tool(
+    "delete_contact",
+    "Permanently delete a contact from Mailjet by email address. Use this to free up room under a plan's contact-count limit — e.g. after a campaign send, once you no longer need the contact record for anything other than dedupe (dedupe should be tracked elsewhere before deleting). Safe to call even if the contact doesn't exist.",
+    { email: z.string() },
+    async (args) => {
+      try {
+        const contact = await mailjetFetch(`/v3/REST/contact/${encodeURIComponent(args.email)}`);
+        const id = contact?.Data?.[0]?.ID;
+        if (id) {
+          await mailjetFetch(`/v3/REST/contact/${id}`, { method: "DELETE" });
+        }
+      } catch (err) {
+        if (err.status !== 404) throw err;
+      }
+      return { content: [{ type: "text", text: `${args.email} deleted from Mailjet (or did not exist).` }] };
     }
   );
 
@@ -174,6 +225,34 @@ app.post("/mcp/:secret", async (req, res) => {
     if (!res.headersSent) {
       res.status(500).json({ error: String(err) });
     }
+  }
+});
+
+// Public, unauthenticated unsubscribe link — this is what the "unsubscribe
+// here" link in every campaign email points to. Recipients click it straight
+// from their inbox, so it deliberately does NOT require the /mcp path secret.
+// It flips IsExcludedFromCampaigns on the matching Mailjet contact so the
+// person is excluded from any future send this account makes.
+app.get("/unsub", async (req, res) => {
+  res.set("Content-Type", "text/html; charset=utf-8");
+  const email = (req.query.email || "").toString().trim().toLowerCase();
+  const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!email || !emailPattern.test(email)) {
+    res.status(400).send("<html><body><p>Missing or invalid email address.</p></body></html>");
+    return;
+  }
+  try {
+    await unsubscribeEmail(email);
+    res.send(`<!DOCTYPE html>
+<html>
+  <body style="font-family:Helvetica,Arial,sans-serif; max-width:480px; margin:64px auto; text-align:center; color:#111;">
+    <h2 style="margin-bottom:8px;">You're unsubscribed</h2>
+    <p style="color:#444;">${email} has been removed from future MindNote emails.</p>
+  </body>
+</html>`);
+  } catch (err) {
+    console.error("Unsubscribe failed for", email, err);
+    res.status(500).send("<html><body><p>Something went wrong processing your request. Please try again later.</p></body></html>");
   }
 });
 
