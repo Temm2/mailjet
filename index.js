@@ -1,7 +1,10 @@
 import express from "express";
+import pg from "pg";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
+
+const { Pool } = pg;
 
 const MAILJET_API_KEY = process.env.MAILJET_API_KEY;
 const MAILJET_API_SECRET = process.env.MAILJET_API_SECRET;
@@ -23,6 +26,104 @@ if (!MAILJET_API_KEY || !MAILJET_API_SECRET) {
   console.warn(
     "WARNING: MAILJET_API_KEY / MAILJET_API_SECRET are not set. Tool calls will fail until you set them as environment variables on your host."
   );
+}
+
+// --- Durable unsubscribe log (Postgres) + Snov.io Do-Not-Contact sync ---
+//
+// The /unsub route below is the real, public link every MindNote campaign
+// email points recipients to. The durable source of truth for "this address
+// opted out" is the Postgres row written there. A best-effort call is also
+// made to push the address into Snov.io's Do-Not-Contact list immediately so
+// the Snov campaigns stop right away -- but since that Snov endpoint's exact
+// field names aren't publicly documented, that call may silently fail on
+// Snov's side even though the opt-out itself is safely recorded here. A
+// periodic reconciliation (run from the Claude session managing the
+// campaign) reads unsynced rows via GET /export?token=... and makes sure
+// every one of them ends up both in Snov's DNC list and in the master
+// campaign CSV's sent_status column. Never remove a row here without a
+// corresponding deliberate un-suppress action -- this table is an
+// append-only opt-out log.
+const pgPool = process.env.DATABASE_URL
+  ? new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+    })
+  : null;
+
+const SNOV_CLIENT_ID = process.env.SNOV_CLIENT_ID;
+const SNOV_CLIENT_SECRET = process.env.SNOV_CLIENT_SECRET;
+const SNOV_DNC_LIST_ID = process.env.SNOV_DNC_LIST_ID; // e.g. 13255757
+const EXPORT_TOKEN = process.env.EXPORT_TOKEN; // shared secret protecting /export
+
+let snovTokenCache = { token: null, expiresAt: 0 };
+
+async function getSnovAccessToken() {
+  if (!SNOV_CLIENT_ID || !SNOV_CLIENT_SECRET) return null;
+  const now = Date.now();
+  if (snovTokenCache.token && snovTokenCache.expiresAt > now + 30_000) {
+    return snovTokenCache.token;
+  }
+  const resp = await fetch("https://api.snov.io/v1/oauth/access_token", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      grant_type: "client_credentials",
+      client_id: SNOV_CLIENT_ID,
+      client_secret: SNOV_CLIENT_SECRET,
+    }),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok || !data.access_token) {
+    throw new Error(`oauth_failed status=${resp.status} body=${JSON.stringify(data).slice(0, 500)}`);
+  }
+  snovTokenCache = {
+    token: data.access_token,
+    expiresAt: now + Number(data.expires_in || 3600) * 1000,
+  };
+  return data.access_token;
+}
+
+async function addToSnovDnc(email) {
+  if (!SNOV_CLIENT_ID || !SNOV_CLIENT_SECRET || !SNOV_DNC_LIST_ID) {
+    return { attempted: false, ok: false, detail: "snov_env_not_configured" };
+  }
+  try {
+    const token = await getSnovAccessToken();
+    const resp = await fetch("https://api.snov.io/v1/add-to-do-not-email-list", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        access_token: token,
+        listId: Number(SNOV_DNC_LIST_ID),
+        list_id: Number(SNOV_DNC_LIST_ID),
+        emails: [email],
+        entries: [email],
+        email,
+      }),
+    });
+    const text = await resp.text();
+    return { attempted: true, ok: resp.ok, status: resp.status, detail: text.slice(0, 1000) };
+  } catch (err) {
+    return { attempted: true, ok: false, detail: String(err).slice(0, 1000) };
+  }
+}
+
+async function ensureSchema() {
+  if (!pgPool) return;
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS unsubscribes (
+      email TEXT PRIMARY KEY,
+      source TEXT NOT NULL DEFAULT 'link_click',
+      campaign_context TEXT,
+      snov_dnc_synced BOOLEAN NOT NULL DEFAULT FALSE,
+      snov_dnc_detail TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      last_sync_attempt_at TIMESTAMPTZ
+    );
+  `);
 }
 
 function mailjetAuthHeader() {
@@ -231,18 +332,52 @@ app.post("/mcp/:secret", async (req, res) => {
 // Public, unauthenticated unsubscribe link — this is what the "unsubscribe
 // here" link in every campaign email points to. Recipients click it straight
 // from their inbox, so it deliberately does NOT require the /mcp path secret.
-// It flips IsExcludedFromCampaigns on the matching Mailjet contact so the
-// person is excluded from any future send this account makes.
+//
+// The durable record is the Postgres row (source of truth). Best-effort, it
+// also pushes the address into Snov.io's Do-Not-Contact list, and — since
+// this server still holds Mailjet credentials too — flips
+// IsExcludedFromCampaigns on the matching Mailjet contact, so the person
+// stays suppressed no matter which platform a future send goes out from.
 app.get("/unsub", async (req, res) => {
   res.set("Content-Type", "text/html; charset=utf-8");
   const email = (req.query.email || "").toString().trim().toLowerCase();
+  const context = (req.query.ctx || "").toString().slice(0, 200) || null;
   const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   if (!email || !emailPattern.test(email)) {
     res.status(400).send("<html><body><p>Missing or invalid email address.</p></body></html>");
     return;
   }
   try {
-    await unsubscribeEmail(email);
+    if (pgPool) {
+      await pgPool.query(
+        `INSERT INTO unsubscribes (email, source, campaign_context)
+         VALUES ($1, 'link_click', $2)
+         ON CONFLICT (email) DO NOTHING`,
+        [email, context]
+      );
+    }
+
+    const snovResult = await addToSnovDnc(email);
+
+    if (pgPool) {
+      await pgPool.query(
+        `UPDATE unsubscribes
+           SET snov_dnc_synced = $2,
+               snov_dnc_detail = $3,
+               last_sync_attempt_at = now()
+         WHERE email = $1`,
+        [email, !!snovResult.ok, JSON.stringify(snovResult).slice(0, 2000)]
+      );
+    }
+
+    // Best-effort, harmless even post-migration: keeps the old Mailjet
+    // contact record in sync too, in case anything still reads it.
+    if (MAILJET_API_KEY && MAILJET_API_SECRET) {
+      unsubscribeEmail(email).catch((err) =>
+        console.warn("Mailjet unsubscribe sync failed for", email, err)
+      );
+    }
+
     res.send(`<!DOCTYPE html>
 <html>
   <body style="font-family:Helvetica,Arial,sans-serif; max-width:480px; margin:64px auto; text-align:center; color:#111;">
@@ -256,11 +391,51 @@ app.get("/unsub", async (req, res) => {
   }
 });
 
+// Read-only export for reconciliation. Protected by a shared-secret query
+// token so this isn't a public data leak -- set EXPORT_TOKEN in Render env
+// vars and pass it as ?token=... when pulling this from Claude.
+app.get("/export", async (req, res) => {
+  if (!pgPool) {
+    res.status(503).json({ error: "database_not_configured" });
+    return;
+  }
+  if (!EXPORT_TOKEN || req.query.token !== EXPORT_TOKEN) {
+    res.status(403).json({ error: "forbidden" });
+    return;
+  }
+  const since = (req.query.since || "").toString();
+  const params = [];
+  let where = "";
+  if (since) {
+    params.push(since);
+    where = "WHERE created_at > $1";
+  }
+  const result = await pgPool.query(
+    `SELECT email, source, campaign_context, snov_dnc_synced, snov_dnc_detail, created_at
+       FROM unsubscribes
+       ${where}
+      ORDER BY created_at ASC`,
+    params
+  );
+  res.json({ count: result.rows.length, rows: result.rows });
+});
+
 app.get("/", (_req, res) => {
   res.send("Mailjet MCP HTTP server is running.");
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Mailjet MCP server listening on port ${PORT}`);
-});
+ensureSchema()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`Mailjet MCP server listening on port ${PORT}`);
+    });
+  })
+  .catch((err) => {
+    console.error("failed_to_init_unsub_schema", err);
+    // Don't block the whole server (MCP tools, Mailjet unsub) on the
+    // unsubscribe-log schema failing to create — degrade gracefully.
+    app.listen(PORT, () => {
+      console.log(`Mailjet MCP server listening on port ${PORT} (unsub schema init failed)`);
+    });
+  });
