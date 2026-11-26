@@ -83,42 +83,88 @@ async function getSnovAccessToken() {
   return data.access_token;
 }
 
+// Snov deprecated the old /v1/add-to-do-not-email-list endpoint this code
+// originally called (it now 404s: "url or entity not found" -- confirmed via
+// live logs on 2026-11-26). Snov's current API exposes the do-not-contact
+// list family under /v2/blacklists, but the exact add-entry request shape
+// isn't available from their public docs page in a form we could fetch
+// programmatically. Rather than guess once and fail silently again, this
+// tries a short list of the most plausible endpoint+body combinations in
+// order, logging every attempt's real status/body, and uses the first one
+// that succeeds. Once we know which candidate actually works (check the
+// logs), this list should be trimmed down to just that one.
+const SNOV_DNC_ADD_CANDIDATES = [
+  {
+    name: "v2_blacklists_id_items_items_field",
+    url: (listId) => `https://api.snov.io/v2/blacklists/${listId}/items`,
+    body: (email) => ({ items: [email] }),
+  },
+  {
+    name: "v2_blacklists_id_items_emails_field",
+    url: (listId) => `https://api.snov.io/v2/blacklists/${listId}/items`,
+    body: (email) => ({ emails: [email] }),
+  },
+  {
+    name: "v2_blacklists_id_direct_items_field",
+    url: (listId) => `https://api.snov.io/v2/blacklists/${listId}`,
+    body: (email) => ({ items: [email] }),
+  },
+  {
+    name: "v1_add_to_do_not_email_list_legacy",
+    url: () => `https://api.snov.io/v1/add-to-do-not-email-list`,
+    body: (email, token, listId) => ({
+      access_token: token,
+      listId: Number(listId),
+      list_id: Number(listId),
+      emails: [email],
+      entries: [email],
+      email,
+    }),
+  },
+];
+
 async function addToSnovDnc(email) {
   if (!SNOV_CLIENT_ID || !SNOV_CLIENT_SECRET || !SNOV_DNC_LIST_ID) {
     console.error(`snov_dnc_sync email=${email} ok=false detail=snov_env_not_configured`);
     return { attempted: false, ok: false, detail: "snov_env_not_configured" };
   }
+  let token;
   try {
-    const token = await getSnovAccessToken();
-    const resp = await fetch("https://api.snov.io/v1/add-to-do-not-email-list", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify({
-        access_token: token,
-        listId: Number(SNOV_DNC_LIST_ID),
-        list_id: Number(SNOV_DNC_LIST_ID),
-        emails: [email],
-        entries: [email],
-        email,
-      }),
-    });
-    const text = await resp.text();
-    // Always logged to stdout/stderr (visible in Render logs) regardless of
-    // whether Postgres is reachable -- this is the fallback source of truth
-    // for diagnosing sync failures when the DB can't be written to.
-    if (resp.ok) {
-      console.log(`snov_dnc_sync email=${email} ok=true status=${resp.status} detail=${text.slice(0, 500)}`);
-    } else {
-      console.error(`snov_dnc_sync email=${email} ok=false status=${resp.status} detail=${text.slice(0, 500)}`);
-    }
-    return { attempted: true, ok: resp.ok, status: resp.status, detail: text.slice(0, 1000) };
+    token = await getSnovAccessToken();
   } catch (err) {
-    console.error(`snov_dnc_sync email=${email} ok=false error=${String(err).slice(0, 500)}`);
-    return { attempted: true, ok: false, detail: String(err).slice(0, 1000) };
+    console.error(`snov_dnc_sync email=${email} ok=false stage=oauth error=${String(err).slice(0, 500)}`);
+    return { attempted: true, ok: false, detail: `oauth_failed: ${String(err).slice(0, 500)}` };
   }
+
+  const attempts = [];
+  for (const candidate of SNOV_DNC_ADD_CANDIDATES) {
+    try {
+      const url = candidate.url(SNOV_DNC_LIST_ID);
+      const resp = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(candidate.body(email, token, SNOV_DNC_LIST_ID)),
+      });
+      const text = await resp.text();
+      const line = `snov_dnc_sync email=${email} candidate=${candidate.name} url=${url} ok=${resp.ok} status=${resp.status} detail=${text.slice(0, 500)}`;
+      if (resp.ok) {
+        console.log(line);
+        return { attempted: true, ok: true, candidate: candidate.name, status: resp.status, detail: text.slice(0, 1000) };
+      } else {
+        console.error(line);
+        attempts.push({ candidate: candidate.name, status: resp.status, detail: text.slice(0, 500) });
+      }
+    } catch (err) {
+      const line = `snov_dnc_sync email=${email} candidate=${candidate.name} ok=false error=${String(err).slice(0, 500)}`;
+      console.error(line);
+      attempts.push({ candidate: candidate.name, error: String(err).slice(0, 500) });
+    }
+  }
+  console.error(`snov_dnc_sync email=${email} ok=false all_candidates_failed=${JSON.stringify(attempts).slice(0, 1500)}`);
+  return { attempted: true, ok: false, detail: JSON.stringify(attempts).slice(0, 2000) };
 }
 
 async function ensureSchema() {
