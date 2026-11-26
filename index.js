@@ -85,6 +85,7 @@ async function getSnovAccessToken() {
 
 async function addToSnovDnc(email) {
   if (!SNOV_CLIENT_ID || !SNOV_CLIENT_SECRET || !SNOV_DNC_LIST_ID) {
+    console.error(`snov_dnc_sync email=${email} ok=false detail=snov_env_not_configured`);
     return { attempted: false, ok: false, detail: "snov_env_not_configured" };
   }
   try {
@@ -105,8 +106,17 @@ async function addToSnovDnc(email) {
       }),
     });
     const text = await resp.text();
+    // Always logged to stdout/stderr (visible in Render logs) regardless of
+    // whether Postgres is reachable -- this is the fallback source of truth
+    // for diagnosing sync failures when the DB can't be written to.
+    if (resp.ok) {
+      console.log(`snov_dnc_sync email=${email} ok=true status=${resp.status} detail=${text.slice(0, 500)}`);
+    } else {
+      console.error(`snov_dnc_sync email=${email} ok=false status=${resp.status} detail=${text.slice(0, 500)}`);
+    }
     return { attempted: true, ok: resp.ok, status: resp.status, detail: text.slice(0, 1000) };
   } catch (err) {
+    console.error(`snov_dnc_sync email=${email} ok=false error=${String(err).slice(0, 500)}`);
     return { attempted: true, ok: false, detail: String(err).slice(0, 1000) };
   }
 }
@@ -347,19 +357,30 @@ app.get("/unsub", async (req, res) => {
     res.status(400).send("<html><body><p>Missing or invalid email address.</p></body></html>");
     return;
   }
-  try {
-    if (pgPool) {
+  // Each side-effect below is independently wrapped: a Postgres outage must
+  // never prevent (or even delay) the Snov DNC sync attempt, since that sync
+  // is the part that actually stops future sends. Every path logs a plain
+  // stdout/stderr line so Render's own log retention is a usable fallback
+  // record when the DB itself is unreachable.
+  if (pgPool) {
+    try {
       await pgPool.query(
         `INSERT INTO unsubscribes (email, source, campaign_context)
          VALUES ($1, 'link_click', $2)
          ON CONFLICT (email) DO NOTHING`,
         [email, context]
       );
+    } catch (err) {
+      console.error(`unsub_pg_insert_failed email=${email} error=${String(err).slice(0, 500)}`);
     }
+  } else {
+    console.error(`unsub_pg_insert_skipped email=${email} reason=pgPool_not_configured`);
+  }
 
-    const snovResult = await addToSnovDnc(email);
+  const snovResult = await addToSnovDnc(email);
 
-    if (pgPool) {
+  if (pgPool) {
+    try {
       await pgPool.query(
         `UPDATE unsubscribes
            SET snov_dnc_synced = $2,
@@ -368,16 +389,22 @@ app.get("/unsub", async (req, res) => {
          WHERE email = $1`,
         [email, !!snovResult.ok, JSON.stringify(snovResult).slice(0, 2000)]
       );
+    } catch (err) {
+      console.error(`unsub_pg_update_failed email=${email} error=${String(err).slice(0, 500)}`);
     }
+  }
 
-    // Best-effort, harmless even post-migration: keeps the old Mailjet
-    // contact record in sync too, in case anything still reads it.
-    if (MAILJET_API_KEY && MAILJET_API_SECRET) {
-      unsubscribeEmail(email).catch((err) =>
-        console.warn("Mailjet unsubscribe sync failed for", email, err)
-      );
-    }
+  // Best-effort, harmless even post-migration: keeps the old Mailjet
+  // contact record in sync too, in case anything still reads it.
+  if (MAILJET_API_KEY && MAILJET_API_SECRET) {
+    unsubscribeEmail(email).catch((err) =>
+      console.warn("Mailjet unsubscribe sync failed for", email, err)
+    );
+  }
 
+  console.log(`unsub_processed email=${email} ctx=${context || ""} snov_ok=${!!snovResult.ok}`);
+
+  try {
     res.send(`<!DOCTYPE html>
 <html>
   <body style="font-family:Helvetica,Arial,sans-serif; max-width:480px; margin:64px auto; text-align:center; color:#111;">
